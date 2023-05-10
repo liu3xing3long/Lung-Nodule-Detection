@@ -23,6 +23,10 @@ from data_detector import DataBowl3Detector, collate
 from split_combine import SplitComb
 from adable import AdaBelief
 
+######################################################
+from devkit.core.dist_utils import init_dist_slurm, init_dist, broadcast_params
+######################################################
+
 parser = argparse.ArgumentParser(description='PyTorch DataBowl3 Detector')
 parser.add_argument('--model', '-m', metavar='MODEL', default='base',
                     help='model')
@@ -59,6 +63,13 @@ parser.add_argument('--cross', default=None, type=str, metavar='N',
 parser.add_argument('--cluster', action='store_true', default=False,
                     help='enables CUDA training (default: False)')
 
+######################################################
+parser.add_argument("--local_rank", type=int)
+parser.add_argument('--port', default=26666, type=int, help='port of server')
+parser.add_argument('--world-size', default=1, type=int)
+parser.add_argument('--rank', default=0, type=int)
+######################################################
+
 args = parser.parse_args()
 best_loss = 100.0
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -69,6 +80,20 @@ else:
     from config_training import config as config_training
 
 use_tqdm = True
+
+######################################################
+rank, world_size = init_dist_slurm(backend='nccl', port=args.port)
+args.rank = rank
+args.world_size = world_size
+#################
+g_local_rank = rank
+#################
+######################################################
+
+def _log_msg(strmsg):
+    global g_local_rank
+    if g_local_rank == 0:
+        print(strmsg)
 
 def get_lr(epoch):
     if epoch <= 10:
@@ -91,7 +116,7 @@ def main():
     cudnn.benchmark = False
 
     # Load model
-    print("=> loading model '{}'".format(args.model))
+    _log_msg("=> loading model '{}'".format(args.model))
     model_root = 'net'
     model = import_module('{}.{}'.format(model_root, args.model))
     config, net, criterion, get_pbb = model.get_model(output_feature=False)
@@ -101,7 +126,7 @@ def main():
         checkpoint = torch.load(args.resume)
         net.load_state_dict(checkpoint['state_dict'])
         best_loss = checkpoint['best_loss']
-        print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
+        _log_msg("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
 
     # Determine the save dir
     if args.save_dir is None:
@@ -142,10 +167,14 @@ def main():
     '''
     # net = net.to(device)    
     gpu_id = range(torch.cuda.device_count()) if args.gpu == 'all' else [int(idx.strip()) for idx in args.gpu.split(',')]        
-    print(fr"gpu_id {gpu_id}")
+    _log_msg(fr"gpu_id {gpu_id}")
 
     net = DataParallel(net, device_ids=gpu_id)
     net = net.cuda()
+
+    ##############################
+    broadcast_params(net)
+    ##############################
     
     # Define loss function (criterion) and optimizer
     # criterion = criterion.to(device)
@@ -153,7 +182,7 @@ def main():
     
     optimizer = AdaBelief(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     pytorch_total_params = sum(p.numel() for p in net.parameters())
-    print("Total number of params = ", pytorch_total_params)
+    _log_msg("Total number of params = ", pytorch_total_params)
 
     # Infer luna16's pbb/lbb, which are used in training the classifier.
     if args.test == 1:
@@ -209,7 +238,7 @@ def train(data_loader, net, criterion, epoch, optimizer, lr_adjuster=None):
     for i, (input, target, coord) in enumerate(pbar):
         # input, target, coord = input.to(device), target.to(device), coord.to(device)
         input, target, coord = input.cuda(), target.cuda(), coord.cuda()
-        # print('input.shape = ', input.shape)
+        # _log_msg('input.shape = ', input.shape)
         # Compute output
         output, _ = net(input, coord)
         loss = criterion(output, target, input, input, train=True)
@@ -241,26 +270,26 @@ def train(data_loader, net, criterion, epoch, optimizer, lr_adjuster=None):
     recall = 100.0 * tpn / (tpn + fnn + eps)
     f1_score = 2 * precision * recall / (precision + recall + eps)
     
-    print('Epoch %03d (lr %.6f)' % (epoch, lr))
-    print('Train:      tpr %3.2f, tnr %3.2f, total pos %d, total neg %d, time %3.2f' % (
+    _log_msg('Epoch %03d (lr %.6f)' % (epoch, lr))
+    _log_msg('Train:      tpr %3.2f, tnr %3.2f, total pos %d, total neg %d, time %3.2f' % (
         100.0 * tpn / total_postive,
         100.0 * tnn / total_negative,
         total_postive,
         total_negative,
         end_time - start_time))
-    print('Train:      Acc %3.2f, P %3.2f, R %3.2f, F1 %3.2f' % (
+    _log_msg('Train:      Acc %3.2f, P %3.2f, R %3.2f, F1 %3.2f' % (
         accuracy,
         precision,
         recall,
         f1_score))
-    print('loss %2.4f, classify loss %2.4f, regress loss %2.4f, %2.4f, %2.4f, %2.4f' % (
+    _log_msg('loss %2.4f, classify loss %2.4f, regress loss %2.4f, %2.4f, %2.4f, %2.4f' % (
         np.mean(metrics[:, 0]),
         np.mean(metrics[:, 1]),
         np.mean(metrics[:, 2]),
         np.mean(metrics[:, 3]),
         np.mean(metrics[:, 4]),
         np.mean(metrics[:, 5]),))
-    print()    
+    _log_msg()    
 
 def validate(data_loader, net, criterion, epoch, save_dir):
     start_time = time.time()
@@ -301,20 +330,20 @@ def validate(data_loader, net, criterion, epoch, save_dir):
     f1_score = 2 * precision * recall / (precision + recall + eps)
 
    
-    print('Valid:      tpr %3.2f, tnr %3.2f, total pos %d, total neg %d, time %3.2f' % (
+    _log_msg('Valid:      tpr %3.2f, tnr %3.2f, total pos %d, total neg %d, time %3.2f' % (
         100.0 * tpn / total_postive,
         100.0 * tnn / total_negative,
         total_postive,
         total_negative,
         end_time - start_time)
           )
-    print('Valid:      Acc %3.2f, P %3.2f, R %3.2f, F1 %3.2f' % (
+    _log_msg('Valid:      Acc %3.2f, P %3.2f, R %3.2f, F1 %3.2f' % (
         accuracy,
         precision,
         recall,
         f1_score)
           )
-    print('loss %2.4f, classify loss %2.4f, regress loss %2.4f, %2.4f, %2.4f, %2.4f' % (
+    _log_msg('loss %2.4f, classify loss %2.4f, regress loss %2.4f, %2.4f, %2.4f, %2.4f' % (
         np.mean(metrics[:, 0]),
         np.mean(metrics[:, 1]),
         np.mean(metrics[:, 2]),
@@ -322,7 +351,7 @@ def validate(data_loader, net, criterion, epoch, save_dir):
         np.mean(metrics[:, 4]),
         np.mean(metrics[:, 5]),)
         )
-    print()    
+    _log_msg()    
 
     val_loss = np.mean(metrics[:, 0])
     return val_loss
@@ -339,7 +368,7 @@ def test(data_loader, net, get_pbb, save_dir, config):
 
     if not bbox_dir_back.is_dir():
         os.makedirs(bbox_dir_back)
-    print('Save pbb/lbb in {}'.format(bbox_dir))
+    _log_msg('Save pbb/lbb in {}'.format(bbox_dir))
 
     net.eval()
     split_comber = data_loader.dataset.split_comber
@@ -391,9 +420,9 @@ def test(data_loader, net, get_pbb, save_dir, config):
             np.save(os.path.join(bbox_dir, name+'_feature.npy'), feature_selected)
 
     end_time = time.time()
-    print('elapsed time is %3.2f seconds' % (end_time - start_time))
-    print()
-    print()
+    _log_msg('elapsed time is %3.2f seconds' % (end_time - start_time))
+    _log_msg()
+    _log_msg()
 
 def save_checkpoint(state, is_best, filename):
     torch.save(state, filename)

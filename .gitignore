@@ -1,0 +1,5 @@
+.flag_preprocess_luna
+json/
+.vscode
+*.pyc
+*.sh
