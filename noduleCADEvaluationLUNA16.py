@@ -1,6 +1,10 @@
-import os
-import math
 import sys
+import os
+
+evalscript_root = "/home/liuxinglong/data/LUNA/evaluationScript" 
+sys.path.append(evalscript_root)
+
+import math
 import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
@@ -165,7 +169,7 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
     nodOutputfile.write((60 * "*") + "\n")
     nodOutputfile.write("\n")
 
-    results = csvTools.readCSV(results_filename)
+    results = csvTools.readCSV(results_filename, mode='rt')
 
     allCandsCAD = {}
     
@@ -524,11 +528,14 @@ def noduleCADEvaluation(annotations_filename,annotations_excluded_filename,serie
 
 
 if __name__ == '__main__':
-    annotations_filename = '../data/LUNA16/evaluationScript/annotations/annotations.csv'
-    annotations_excluded_filename = '../data/LUNA16/evaluationScript/annotations/annotations_excluded.csv'
-    seriesuids_filename = '../data/LUNA16/evaluationScript/annotations/seriesuids.csv'
 
-    results_filename = args.model+'_80_all.csv'
-    outputDir = './CPM_Results_'+args.model+'_80/'
+    annotations_filename = fr'{evalscript_root}/annotations/annotations.csv'
+    annotations_excluded_filename = fr'{evalscript_root}/annotations/annotations_excluded.csv'
+    seriesuids_filename = fr'{evalscript_root}/annotations/seriesuids.csv'
+
+    eval_target = 'ckpt_230509_test'
+
+    results_filename = fr'./{eval_target}.csv'
+    outputDir = fr'./CPM_Results_{eval_target}' 
     noduleCADEvaluation(annotations_filename,annotations_excluded_filename,seriesuids_filename,results_filename,outputDir)
     print("Finished!")

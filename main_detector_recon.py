@@ -96,6 +96,21 @@ def main():
     model = import_module('{}.{}'.format(model_root, args.model))
     config, net, criterion, get_pbb = model.get_model(output_feature=False)
 
+    #############################################################
+    # Setup GPU    
+    '''
+    n_gpu = setgpu(args.gpu)
+    args.n_gpu = n_gpu
+    gpu_id = range(torch.cuda.device_count()) if args.gpu == 'all' else [int(idx.strip()) for idx in args.gpu.split(',')]        
+    '''
+    # net = net.to(device)    
+    gpu_id = range(torch.cuda.device_count()) if args.gpu == 'all' else [int(idx.strip()) for idx in args.gpu.split(',')]        
+    print(fr"gpu_id {gpu_id}")
+
+    net = DataParallel(net, device_ids=gpu_id)
+    net = net.cuda()
+    #############################################################
+
     # If possible, resume from a checkpoint
     if args.resume:
         checkpoint = torch.load(args.resume)
@@ -111,7 +126,8 @@ def main():
             exp_id = time.strftime('%Y%m%d-%H%M%S', time.localtime())
             save_dir = os.path.join('results', f'{args.model}_{exp_id}')
     else:
-        save_dir = os.path.join('results', args.save_dir)
+        exp_id = time.strftime('%Y%m%d-%H%M%S', time.localtime())
+        save_dir = os.path.join('results', fr"{args.save_dir}_{exp_id}")
 
     # Determine the start epoch
     if args.start_epoch is None:
@@ -133,20 +149,7 @@ def main():
             os.makedirs(Path(save_dir)/'net')
         for f in pyfiles:
             shutil.copy(f, Path(save_dir)/f)
-            
-    # Setup GPU    
-    '''
-    n_gpu = setgpu(args.gpu)
-    args.n_gpu = n_gpu
-    gpu_id = range(torch.cuda.device_count()) if args.gpu == 'all' else [int(idx.strip()) for idx in args.gpu.split(',')]        
-    '''
-    # net = net.to(device)    
-    gpu_id = range(torch.cuda.device_count()) if args.gpu == 'all' else [int(idx.strip()) for idx in args.gpu.split(',')]        
-    print(fr"gpu_id {gpu_id}")
-
-    net = DataParallel(net, device_ids=gpu_id)
-    net = net.cuda()
-    
+               
     # Define loss function (criterion) and optimizer
     # criterion = criterion.to(device)
     criterion = criterion.cuda()

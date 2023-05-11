@@ -3,3 +3,5 @@ json/
 .vscode
 *.pyc
 *.sh
+*.ckpt
+CPM_Results_ckpt_230509_test

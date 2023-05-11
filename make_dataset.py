@@ -1,22 +1,38 @@
 import json
 import glob
-
-src = './json/1/'
-tar = './json/1/'
-
-src_ext = 'txt'
-tar_ext = 'json'
+import os
 
 
-files = glob.glob(fr'{src}/*.{src_ext}')
-for fn in files:
-    print(fn)
+input_file = './json/all/all.txt'
+outputpath = './json/'
+input_all_suids = []
+with open(input_file, 'rt') as fp:
+    suids = fp.readlines()
+    for suid in suids:
+        input_all_suids.append(suid.replace("\n", "").replace('.mhd', ''))
 
-    with open(fn, 'r') as fp:
-        suids = fp.readlines()
+for ii in range(5):
+    thisoutputpath = fr'{outputpath}/{ii + 1}'
+    
+    trainset = []
+    valset = []
+    for isuid in input_all_suids:
+        keyword = fr'subset{ii * 2}'
+        keyword2 = fr'subset{ii * 2 + 1}'
 
-        outputsuids = []
-        for suid in suids:
-            outputsuids.append(suid.replace("\n", ""))
-        with open(fn.replace(src_ext, tar_ext), 'w+') as fp2:
-            json.dump(outputsuids, fp2)
+        thissuid = isuid[isuid.index('/') + 1: ]
+        if keyword in isuid or keyword2 in isuid:
+            valset.append(thissuid)
+        else:
+            trainset.append(thissuid)
+
+    if not os.path.exists(thisoutputpath):
+        os.makedirs(thisoutputpath)
+    
+    print(len(trainset), len(valset))
+    with open(fr"{thisoutputpath}/LUNA_train.json", 'wt') as fp:
+        json.dump(trainset, fp)
+    with open(fr"{thisoutputpath}/LUNA_test.json", 'wt') as fp:
+        json.dump(valset, fp)
+    with open(fr"{thisoutputpath}/LUNA_val.json", 'wt') as fp:
+        json.dump(valset, fp)

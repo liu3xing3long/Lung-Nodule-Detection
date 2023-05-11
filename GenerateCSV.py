@@ -94,13 +94,16 @@ def main(bbox_path, preprocess_path, lunaseg_path, save_file):
     epochs = args.epoch
     epochs = epochs.split('.') 
     count = 0
-    for i in range(5):
+    for i in range(1):
         total_list.append([])        
-        with Path('test_0222_%s/LUNA_test.json' %str(i+1)).open('rt', encoding='utf-8') as fp:
+        # with Path('test_0222_%s/LUNA_test.json' %str(i+1)).open('rt', encoding='utf-8') as fp:
+        with Path('./json/%s/LUNA_test.json' %str(i+1)).open('rt', encoding='utf-8') as fp:
             idcs = json.load(fp)
         for x in tqdm(range(len(idcs))):            
-            pbb = np.load('%s%s/bbox_%s/%s_pbb.npy' %(bbox_path, str(i+1), epochs[i], idcs[x]), mmap_mode='r')            
+            # pbb = np.load('%s%s/bbox_%s/%s_pbb.npy' %(bbox_path, str(i+1), epochs[i], idcs[x]), mmap_mode='r')            
+            pbb = np.load('%s/bbox_%s/%s_pbb.npy' %(bbox_path, epochs[i], idcs[x]), mmap_mode='r')            
             lbb = np.load("%s%s_label.npy" % (preprocess_path, idcs[x]), allow_pickle=True)            
+
             pbb = nms(pbb, 0.1)            
 
             Mask,origin,spacing,isflip = load_itk_image('%s%s.mhd' %(lunaseg_path, idcs[x]))
@@ -138,7 +141,15 @@ def main(bbox_path, preprocess_path, lunaseg_path, save_file):
                         f.write("%s,%.9f,%.9f,%.9f,%.9f\n" %(j[0], j[1], j[2], j[3], j[4]))
         
 if __name__=='__main__':
-    main(bbox_path='./results/'+args.model+'_testcross', preprocess_path='../data/preprocess/all/', lunaseg_path='../data/LUNA16/seg-lungs-LUNA16/', save_file=args.model+'_80_all.csv')
+    from config_training import config
+
+    args.epoch = "050"
+
+    genrate_target = "ckpt_230509_test"
+    main(bbox_path='./results/'+ genrate_target, 
+        preprocess_path=config['preprocess_result_path'], 
+        lunaseg_path=config['luna_segment'], 
+        save_file=fr'{genrate_target}.csv')
 
 
 

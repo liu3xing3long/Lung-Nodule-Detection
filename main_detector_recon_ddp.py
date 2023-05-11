@@ -14,8 +14,10 @@ from tqdm import tqdm
 
 import torch
 from torch.nn import DataParallel
+from torch.nn.parallel import DistributedDataParallel
 from torch.backends import cudnn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from data_detector import DataBowl3Detector, collate
 # from data_detector import NoduleMalignancyDetector
@@ -24,7 +26,7 @@ from split_combine import SplitComb
 from adable import AdaBelief
 
 ######################################################
-from devkit.core.dist_utils import init_dist_slurm, init_dist, broadcast_params
+from devkit.core.dist_utils import init_dist_slurm, init_dist, broadcast_params, average_gradients
 ######################################################
 
 parser = argparse.ArgumentParser(description='PyTorch DataBowl3 Detector')
@@ -72,7 +74,6 @@ parser.add_argument('--rank', default=0, type=int)
 
 args = parser.parse_args()
 best_loss = 100.0
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 if args.cluster:
     from config_training import config_cluster as config_training
@@ -81,19 +82,20 @@ else:
 
 use_tqdm = True
 
-######################################################
-rank, world_size = init_dist_slurm(backend='nccl', port=args.port)
-args.rank = rank
-args.world_size = world_size
-#################
-g_local_rank = rank
-#################
-######################################################
+g_local_rank = -1
+g_local_world_size = -1
 
-def _log_msg(strmsg):
+
+def _log_msg(strmsg="\n"):
     global g_local_rank
     if g_local_rank == 0:
         print(strmsg)
+
+def datestr():
+    now = time.gmtime()
+    return '{}{:02}{:02}_{:02}{:02}{:02}_{}'.format(now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min,
+                                                    now.tm_sec, int(round(time.time() * 1000)))
+
 
 def get_lr(epoch):
     if epoch <= 10:
@@ -105,7 +107,19 @@ def get_lr(epoch):
     return lr
 
 def main():
-    global args, best_loss
+    global args, best_loss, g_local_rank, g_local_world_size
+
+    ######################################################
+    rank, world_size = init_dist_slurm(backend='nccl', port=args.port)
+
+    g_local_rank = rank
+    g_local_world_size = world_size
+    print(fr"dist settings: {g_local_rank} / {g_local_world_size}")
+
+    # torch.cuda.set_device(g_local_rank)
+    # device = torch.device('cuda', g_local_rank)
+    ######################################################
+
     datadir = config_training['preprocess_result_path']
     
     train_id = './json/' + args.cross + '/LUNA_train.json'
@@ -136,7 +150,8 @@ def main():
             exp_id = time.strftime('%Y%m%d-%H%M%S', time.localtime())
             save_dir = os.path.join('results', f'{args.model}_{exp_id}')
     else:
-        save_dir = os.path.join('results', args.save_dir)
+        exp_id = time.strftime('%Y%m%d-%H%M%S', time.localtime())
+        save_dir = os.path.join('results', fr"{args.save_dir}_{exp_id}")
 
     # Determine the start epoch
     if args.start_epoch is None:
@@ -148,16 +163,17 @@ def main():
         start_epoch = args.start_epoch
 
     # If no save_dir, make a new one
-    if not os.path.isdir(save_dir):
-        os.makedirs(save_dir)
+    if g_local_rank == 0:
+        if not os.path.isdir(save_dir):
+            os.makedirs(save_dir)
 
     # Preserve training parameters for future analysis
-    if args.test != 1:
-        pyfiles = list(Path('.').glob('*.py')) + list(Path('net').glob('*.py'))
-        if not (Path(save_dir)/'net').is_dir():
-            os.makedirs(Path(save_dir)/'net')
-        for f in pyfiles:
-            shutil.copy(f, Path(save_dir)/f)
+    # if args.test != 1:
+    #     pyfiles = list(Path('.').glob('*.py')) + list(Path('net').glob('*.py'))
+    #     if not (Path(save_dir)/'net').is_dir():
+    #         os.makedirs(Path(save_dir)/'net')
+    #     for f in pyfiles:
+    #         shutil.copy(f, Path(save_dir)/f)
             
     # Setup GPU    
     '''
@@ -165,15 +181,15 @@ def main():
     args.n_gpu = n_gpu
     gpu_id = range(torch.cuda.device_count()) if args.gpu == 'all' else [int(idx.strip()) for idx in args.gpu.split(',')]        
     '''
-    # net = net.to(device)    
-    gpu_id = range(torch.cuda.device_count()) if args.gpu == 'all' else [int(idx.strip()) for idx in args.gpu.split(',')]        
-    _log_msg(fr"gpu_id {gpu_id}")
-
-    net = DataParallel(net, device_ids=gpu_id)
+    # net = net.to(device)
     net = net.cuda()
+    # gpu_id = range(torch.cuda.device_count()) if args.gpu == 'all' else [int(idx.strip()) for idx in args.gpu.split(',')]        
+    # _log_msg(fr"gpu_id {gpu_id}")
+    # net = DataParallel(net, device_ids=gpu_id)
 
     ##############################
     broadcast_params(net)
+    # net = DistributedDataParallel(net)
     ##############################
     
     # Define loss function (criterion) and optimizer
@@ -182,46 +198,61 @@ def main():
     
     optimizer = AdaBelief(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     pytorch_total_params = sum(p.numel() for p in net.parameters())
-    _log_msg("Total number of params = ", pytorch_total_params)
+    _log_msg("Total number of params = {}".format(pytorch_total_params))
 
-    # Infer luna16's pbb/lbb, which are used in training the classifier.
-    if args.test == 1:
-        margin = 16#16#32
-        sidelen = 48#64#144
-        split_comber = SplitComb(sidelen, config['max_stride'], config['stride'], margin, config['pad_value'])
-        testset = DataBowl3Detector(datadir, test_id, config,
-                                           phase='test', split_comber=split_comber)
-        test_loader = DataLoader(testset, batch_size=1, shuffle=False, num_workers=0,
-                                 collate_fn=collate, pin_memory=False)
-        test(test_loader, net, get_pbb, save_dir, config)        
-        return
+    #########################################################################################
+    # NOT test in DDP
+    # # Infer luna16's pbb/lbb, which are used in training the classifier.
+    # if args.test == 1:
+    #     margin = 16#16#32
+    #     sidelen = 48#64#144
+    #     split_comber = SplitComb(sidelen, config['max_stride'], config['stride'], margin, config['pad_value'])
+    #     testset = DataBowl3Detector(datadir, test_id, config,
+    #                                        phase='test', split_comber=split_comber)
+    #     test_loader = DataLoader(testset, batch_size=1, shuffle=False, num_workers=0,
+    #                              collate_fn=collate, pin_memory=False)
+    #     test(test_loader, net, get_pbb, save_dir, config)        
+    #     return
+    #########################################################################################
 
     trainset = DataBowl3Detector(datadir, train_id, config, phase='train')
-    train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
-                              pin_memory=True)
+    distsampler_train = DistributedSampler(trainset)
+    train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
+                              pin_memory=True, sampler=distsampler_train)
+
     valset = DataBowl3Detector(datadir, val_id, config, phase='val')
+    distsampler_val = DistributedSampler(valset)
     val_loader = DataLoader(valset, batch_size=1, shuffle=False, num_workers=args.workers,
-                            pin_memory=True)
+                            pin_memory=True, sampler=distsampler_val)
 
     # run train and validate
     for epoch in range(start_epoch, args.epochs + 1):
         # Train for one epoch
+        
+        ##################################
+        distsampler_train.set_epoch(epoch)
+        ##################################
         train(train_loader, net, criterion, epoch, optimizer)
+
+        ##################################
+        distsampler_val.set_epoch(epoch)
+        ##################################
         # Evaluate on validation set
         val_loss = validate(val_loader, net, criterion, epoch, save_dir)
         # Remember the best val_loss and save checkpoint
         is_best = val_loss < best_loss
         best_loss = min(val_loss, best_loss)
 
-        if epoch % args.save_freq == 0 or is_best:
-            state_dict = net.state_dict()
-            state_dict = {k:v.cpu() for k, v in state_dict.items()}
-            state = {'epoch': epoch,
-                     'save_dir': save_dir,
-                     'state_dict': state_dict,
-                     'args': args,
-                     'best_loss': best_loss}
-            save_checkpoint(state, is_best, os.path.join(save_dir, '{:>03d}.ckpt'.format(epoch)))
+        if g_local_rank == 0:
+            if epoch % args.save_freq == 0 or is_best:
+                state_dict = net.state_dict()
+                state_dict = {k:v.cpu() for k, v in state_dict.items()}
+                state = {'epoch': epoch,
+                        'save_dir': save_dir,
+                        'state_dict': state_dict,
+                        'args': args,
+                        'best_loss': best_loss}
+                save_checkpoint(state, is_best, os.path.join(save_dir, '{:>03d}.ckpt'.format(epoch)))
 
 def train(data_loader, net, criterion, epoch, optimizer, lr_adjuster=None):
     start_time = time.time()
@@ -243,8 +274,17 @@ def train(data_loader, net, criterion, epoch, optimizer, lr_adjuster=None):
         output, _ = net(input, coord)
         loss = criterion(output, target, input, input, train=True)
         
+        ##########################
+        loss = [lloss / float(g_local_world_size) for lloss in loss]
+        ##########################
+
         # Compute gradient and do optimizer step
         loss[0].backward()
+        
+        ##########################
+        average_gradients(net)
+        ##########################
+
         optimizer.step()
         optimizer.zero_grad()
 
@@ -305,11 +345,17 @@ def validate(data_loader, net, criterion, epoch, save_dir):
     with torch.no_grad():
         pbar = tqdm(data_loader) if use_tqdm else data_loader
         for i, (input, target, coord) in enumerate(pbar):
-            input, target, coord = input.to(device), target.to(device), coord.to(device)
+            # input, target, coord = input.to(device), target.to(device), coord.to(device)
+            input, target, coord = input.cuda(), target.cuda(), coord.cuda()
 
             # Compute output and loss
             output, _ = net(input, coord, 'val')
             loss = criterion(output, target, input, input, train=False)
+
+            #############################
+            loss = [lloss / float(g_local_world_size) for lloss in loss]
+            #############################
+
             loss[0] = loss[0].item()
             metrics.append(loss)
 
@@ -356,73 +402,73 @@ def validate(data_loader, net, criterion, epoch, save_dir):
     val_loss = np.mean(metrics[:, 0])
     return val_loss
 
-def test(data_loader, net, get_pbb, save_dir, config):
-    start_time = time.time()
-    epoch = args.resume.split('/')[-1].split('.')[0]
+# def test(data_loader, net, get_pbb, save_dir, config):
+    # start_time = time.time()
+    # epoch = args.resume.split('/')[-1].split('.')[0]
 
-    bbox_dir = Path(save_dir)/'bbox'
-    bbox_dir_back = Path(save_dir)/'bbox_{}'.format(epoch)
+    # bbox_dir = Path(save_dir)/'bbox'
+    # bbox_dir_back = Path(save_dir)/'bbox_{}'.format(epoch)
 
-    if not bbox_dir.is_dir():
-        os.makedirs(bbox_dir)
+    # if not bbox_dir.is_dir():
+    #     os.makedirs(bbox_dir)
 
-    if not bbox_dir_back.is_dir():
-        os.makedirs(bbox_dir_back)
-    _log_msg('Save pbb/lbb in {}'.format(bbox_dir))
+    # if not bbox_dir_back.is_dir():
+    #     os.makedirs(bbox_dir_back)
+    # _log_msg('Save pbb/lbb in {}'.format(bbox_dir))
 
-    net.eval()
-    split_comber = data_loader.dataset.split_comber
+    # net.eval()
+    # split_comber = data_loader.dataset.split_comber
 
-    pbar = tqdm(data_loader) if use_tqdm else data_loader
-    for i_name, (data, target, coord, nzhw) in enumerate(pbar):
-        target = [np.asarray(t, np.float32) for t in target]
-        lbb = target[0]
-        nzhw = nzhw[0]
-        name = os.path.basename(data_loader.dataset.filenames[i_name]).split('_clean.npy')[0]        
-        data = data[0][0]        
-        coord = coord[0][0]        
-        isfeat = False
-        splitlist = list(range(0, len(data)+1, args.n_test))
+    # pbar = tqdm(data_loader) if use_tqdm else data_loader
+    # for i_name, (data, target, coord, nzhw) in enumerate(pbar):
+    #     target = [np.asarray(t, np.float32) for t in target]
+    #     lbb = target[0]
+    #     nzhw = nzhw[0]
+    #     name = os.path.basename(data_loader.dataset.filenames[i_name]).split('_clean.npy')[0]        
+    #     data = data[0][0]        
+    #     coord = coord[0][0]        
+    #     isfeat = False
+    #     splitlist = list(range(0, len(data)+1, args.n_test))
 
-        if splitlist[-1] != len(data):
-            splitlist.append(len(data))
+    #     if splitlist[-1] != len(data):
+    #         splitlist.append(len(data))
 
-        outputlist = []
-        featurelist = []
+    #     outputlist = []
+    #     featurelist = []
 
-        with torch.no_grad():
-            for i in range(len(splitlist)-1):
-                input = data[splitlist[i]:splitlist[i+1]].to(device)
-                inputcoord = coord[splitlist[i]:splitlist[i+1]].to(device)
-                if isfeat:
-                    feature, output, recon = net(input, inputcoord)
-                    featurelist.append(feature.detach().cpu().numpy())
-                else:
-                    output, recon = net(input, inputcoord, 'val')
-                outputlist.append(output.detach().cpu().numpy())
-        output = np.concatenate(outputlist, axis=0)
+    #     with torch.no_grad():
+    #         for i in range(len(splitlist)-1):
+    #             input = data[splitlist[i]:splitlist[i+1]].to(device)
+    #             inputcoord = coord[splitlist[i]:splitlist[i+1]].to(device)
+    #             if isfeat:
+    #                 feature, output, recon = net(input, inputcoord)
+    #                 featurelist.append(feature.detach().cpu().numpy())
+    #             else:
+    #                 output, recon = net(input, inputcoord, 'val')
+    #             outputlist.append(output.detach().cpu().numpy())
+    #     output = np.concatenate(outputlist, axis=0)
         
-        output = split_comber.combine(output, nzhw=nzhw)
-        thresh = config['conf_thresh']
-        pbb, mask = get_pbb(output, thresh, ismask=True)
-        # Save nodule prediction
-        np.save(os.path.join(bbox_dir, name + '_pbb.npy'), pbb)
-        # Save nodule ground truth
-        np.save(os.path.join(bbox_dir, name + '_lbb.npy'), lbb)
-        np.save(os.path.join(bbox_dir_back, name + '_pbb.npy'), pbb)
-        # Save nodule ground truth
-        np.save(os.path.join(bbox_dir_back, name + '_lbb.npy'), lbb)
+    #     output = split_comber.combine(output, nzhw=nzhw)
+    #     thresh = config['conf_thresh']
+    #     pbb, mask = get_pbb(output, thresh, ismask=True)
+    #     # Save nodule prediction
+    #     np.save(os.path.join(bbox_dir, name + '_pbb.npy'), pbb)
+    #     # Save nodule ground truth
+    #     np.save(os.path.join(bbox_dir, name + '_lbb.npy'), lbb)
+    #     np.save(os.path.join(bbox_dir_back, name + '_pbb.npy'), pbb)
+    #     # Save nodule ground truth
+    #     np.save(os.path.join(bbox_dir_back, name + '_lbb.npy'), lbb)
 
-        if isfeat:
-            feature = np.concatenate(featurelist,0).transpose([0,2,3,4,1])[:,:,:,:,:,np.newaxis]
-            feature = split_comber.combine(feature, nzhw=nzhw)[...,0]
-            feature_selected = feature[mask[0], mask[1], mask[2]]
-            np.save(os.path.join(bbox_dir, name+'_feature.npy'), feature_selected)
+    #     if isfeat:
+    #         feature = np.concatenate(featurelist,0).transpose([0,2,3,4,1])[:,:,:,:,:,np.newaxis]
+    #         feature = split_comber.combine(feature, nzhw=nzhw)[...,0]
+    #         feature_selected = feature[mask[0], mask[1], mask[2]]
+    #         np.save(os.path.join(bbox_dir, name+'_feature.npy'), feature_selected)
 
-    end_time = time.time()
-    _log_msg('elapsed time is %3.2f seconds' % (end_time - start_time))
-    _log_msg()
-    _log_msg()
+    # end_time = time.time()
+    # _log_msg('elapsed time is %3.2f seconds' % (end_time - start_time))
+    # _log_msg()
+    # _log_msg()
 
 def save_checkpoint(state, is_best, filename):
     torch.save(state, filename)
